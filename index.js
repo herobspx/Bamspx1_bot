@@ -60,7 +60,9 @@ const BANK_NAME = process.env.BANK_NAME || 'اسم البنك';
 const ACCOUNT_NAME = process.env.ACCOUNT_NAME || 'اسم صاحب الحساب';
 const BANK_IBAN = process.env.BANK_IBAN || 'SAxxxxxxxxxxxxxxxxxxxx';
 const SUPPORT_USERNAME = process.env.SUPPORT_USERNAME || '@support';
-const CHANNEL_INVITE_LINK = process.env.CHANNEL_INVITE_LINK || 'https://t.me/';
+
+// مدة صلاحية رابط طلب الانضمام بالدقائق
+const JOIN_LINK_EXPIRE_MINUTES = Number(process.env.JOIN_LINK_EXPIRE_MINUTES || 10);
 
 if (Number.isNaN(CHANNEL_ID)) {
   console.error('CHANNEL_ID is not a valid number:', process.env.CHANNEL_ID);
@@ -68,6 +70,10 @@ if (Number.isNaN(CHANNEL_ID)) {
 }
 if (Number.isNaN(ADMIN_ID)) {
   console.error('ADMIN_ID is not a valid number:', process.env.ADMIN_ID);
+  process.exit(1);
+}
+if (Number.isNaN(JOIN_LINK_EXPIRE_MINUTES) || JOIN_LINK_EXPIRE_MINUTES <= 0) {
+  console.error('JOIN_LINK_EXPIRE_MINUTES is invalid:', process.env.JOIN_LINK_EXPIRE_MINUTES);
   process.exit(1);
 }
 
@@ -102,6 +108,12 @@ async function connectDB() {
     console.log('Connecting to MongoDB...');
     await client.connect();
     db = client.db('bamspx1');
+
+    await db.collection('users').createIndex({ user_id: 1 }, { unique: true });
+    await db.collection('orders').createIndex({ order_id: 1 }, { unique: true });
+    await db.collection('join_links').createIndex({ user_id: 1 });
+    await db.collection('join_links').createIndex({ invite_link: 1 });
+
     console.log('DB connected');
   } catch (err) {
     console.error('DB CONNECTION ERROR:', err);
@@ -147,6 +159,64 @@ function paymentText(order_id, planName, price) {
 ${BANK_IBAN}
 
 بعد التحويل اضغط "تم التحويل" ثم أرسل صورة الإيصال.`;
+}
+
+async function revokeActiveJoinLinksForUser(userId) {
+  const activeLinks = await db.collection('join_links').find({
+    user_id: userId,
+    status: { $in: ['ACTIVE', 'PENDING_JOIN'] }
+  }).toArray();
+
+  for (const link of activeLinks) {
+    try {
+      await bot.telegram.callApi('revokeChatInviteLink', {
+        chat_id: CHANNEL_ID,
+        invite_link: link.invite_link
+      });
+    } catch (err) {
+      console.error('REVOKE LINK ERROR:', err?.description || err);
+    }
+
+    await db.collection('join_links').updateOne(
+      { _id: link._id },
+      {
+        $set: {
+          status: 'REVOKED',
+          revoked_at: new Date()
+        }
+      }
+    );
+  }
+}
+
+async function createPrivateJoinRequestLinkForUser(userId, orderId) {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + JOIN_LINK_EXPIRE_MINUTES * 60 * 1000);
+  const expireDateUnix = Math.floor(expiresAt.getTime() / 1000);
+
+  const linkResponse = await bot.telegram.callApi('createChatInviteLink', {
+    chat_id: CHANNEL_ID,
+    name: `order_${orderId}_user_${userId}`,
+    expire_date: expireDateUnix,
+    creates_join_request: true
+  });
+
+  await db.collection('join_links').insertOne({
+    user_id: userId,
+    order_id: orderId,
+    invite_link: linkResponse.invite_link,
+    invite_link_name: linkResponse.name || null,
+    expires_at: expiresAt,
+    status: 'ACTIVE',
+    created_at: new Date(),
+    approved_join_at: null,
+    used_by_user_id: null
+  });
+
+  return {
+    inviteLink: linkResponse.invite_link,
+    expiresAt
+  };
 }
 
 bot.start(async (ctx) => {
@@ -208,15 +278,23 @@ bot.hears('حالة الاشتراك', async (ctx) => {
       );
     }
 
+    const activeJoinLink = await db.collection('join_links').findOne({
+      user_id: ctx.from.id,
+      status: { $in: ['ACTIVE', 'PENDING_JOIN', 'APPROVED'] }
+    });
+
+    const buttons = [];
+    if (activeJoinLink && ['ACTIVE', 'PENDING_JOIN'].includes(activeJoinLink.status)) {
+      buttons.push([Markup.button.url('رابط الدخول الحالي', activeJoinLink.invite_link)]);
+    }
+    buttons.push([Markup.button.callback('تجديد الاشتراك', 'open_plans')]);
+
     await ctx.reply(
       `حالة الاشتراك: نشط
 
 الباقة: ${user.plan}
 ينتهي: ${new Date(user.end_date).toLocaleString('ar-SA')}`,
-      Markup.inlineKeyboard([
-        [Markup.button.url('دخول القناة', CHANNEL_INVITE_LINK)],
-        [Markup.button.callback('تجديد الاشتراك', 'open_plans')]
-      ])
+      Markup.inlineKeyboard(buttons)
     );
   } catch (err) {
     console.error('STATUS ERROR:', err);
@@ -312,10 +390,8 @@ bot.action(/plan_(.+)/, async (ctx) => {
 bot.action('copy_iban', async (ctx) => {
   try {
     await ctx.answerCbQuery('تم عرض الآيبان');
-    await ctx.reply(
-      `رقم الآيبان:
-${BANK_IBAN}`
-    );
+    await ctx.reply(`رقم الآيبان:
+${BANK_IBAN}`);
   } catch (err) {
     console.error('COPY IBAN ERROR:', err);
   }
@@ -442,6 +518,12 @@ bot.action(/approve_(.+)/, async (ctx) => {
       }
     );
 
+    // إلغاء أي روابط سابقة للمستخدم
+    await revokeActiveJoinLinksForUser(order.user_id);
+
+    // إنشاء رابط طلب انضمام خاص بالمستخدم
+    const { inviteLink, expiresAt } = await createPrivateJoinRequestLinkForUser(order.user_id, order_id);
+
     await bot.telegram.sendMessage(
       order.user_id,
       `تم تفعيل اشتراكك بنجاح
@@ -449,9 +531,13 @@ bot.action(/approve_(.+)/, async (ctx) => {
 الباقة: ${order.plan}
 ينتهي الاشتراك: ${end.toLocaleString('ar-SA')}
 
-يمكنك الدخول إلى القناة من الرابط التالي.`,
+هذا الرابط خاص بك فقط.
+صلاحية الرابط تنتهي خلال ${JOIN_LINK_EXPIRE_MINUTES} دقائق.
+
+بعد الضغط على الرابط:
+أرسل طلب الانضمام، وسيتم قبولك تلقائياً إذا كان الحساب هو نفس الحساب المشترك.`,
       Markup.inlineKeyboard([
-        [Markup.button.url('دخول القناة', CHANNEL_INVITE_LINK)],
+        [Markup.button.url('طلب الانضمام', inviteLink)],
         [Markup.button.url('الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
       ])
     );
@@ -509,11 +595,130 @@ bot.action(/reject_(.+)/, async (ctx) => {
   }
 });
 
+// استقبال طلبات الانضمام والموافقة فقط على صاحب الاشتراك
+bot.on('chat_join_request', async (ctx) => {
+  try {
+    const joinRequest = ctx.update.chat_join_request;
+    const requestUserId = joinRequest.from.id;
+    const inviteLinkUsed = joinRequest.invite_link?.invite_link || null;
+
+    console.log('CHAT JOIN REQUEST:', {
+      requestUserId,
+      inviteLinkUsed,
+      chatId: joinRequest.chat.id
+    });
+
+    const joinLink = await db.collection('join_links').findOne({
+      invite_link: inviteLinkUsed
+    });
+
+    if (!joinLink) {
+      await bot.telegram.callApi('declineChatJoinRequest', {
+        chat_id: CHANNEL_ID,
+        user_id: requestUserId
+      });
+      return;
+    }
+
+    const now = new Date();
+
+    if (joinLink.status !== 'ACTIVE' && joinLink.status !== 'PENDING_JOIN') {
+      await bot.telegram.callApi('declineChatJoinRequest', {
+        chat_id: CHANNEL_ID,
+        user_id: requestUserId
+      });
+      return;
+    }
+
+    if (new Date(joinLink.expires_at).getTime() < now.getTime()) {
+      await db.collection('join_links').updateOne(
+        { _id: joinLink._id },
+        {
+          $set: {
+            status: 'EXPIRED',
+            expired_at: now
+          }
+        }
+      );
+
+      await bot.telegram.callApi('declineChatJoinRequest', {
+        chat_id: CHANNEL_ID,
+        user_id: requestUserId
+      });
+
+      if (requestUserId === joinLink.user_id) {
+        try {
+          await bot.telegram.sendMessage(
+            requestUserId,
+            `انتهت صلاحية رابط الانضمام.
+
+يرجى التواصل مع الدعم أو طلب رابط جديد من الإدارة.`
+          );
+        } catch (err) {
+          console.error('EXPIRED LINK MESSAGE ERROR:', err);
+        }
+      }
+      return;
+    }
+
+    if (requestUserId !== joinLink.user_id) {
+      await bot.telegram.callApi('declineChatJoinRequest', {
+        chat_id: CHANNEL_ID,
+        user_id: requestUserId
+      });
+
+      try {
+        await bot.telegram.sendMessage(
+          ADMIN_ID,
+          `تم رفض طلب انضمام من مستخدم غير مطابق للرابط الخاص.
+
+User ID: ${requestUserId}
+الرابط مخصص للمستخدم: ${joinLink.user_id}`
+        );
+      } catch (err) {
+        console.error('ADMIN ALERT ERROR:', err);
+      }
+
+      return;
+    }
+
+    await bot.telegram.callApi('approveChatJoinRequest', {
+      chat_id: CHANNEL_ID,
+      user_id: requestUserId
+    });
+
+    await db.collection('join_links').updateOne(
+      { _id: joinLink._id },
+      {
+        $set: {
+          status: 'APPROVED',
+          approved_join_at: now,
+          used_by_user_id: requestUserId
+        }
+      }
+    );
+
+    try {
+      await bot.telegram.sendMessage(
+        requestUserId,
+        `تم قبول طلب انضمامك بنجاح.
+
+مرحباً بك في BAMSPX.`
+      );
+    } catch (err) {
+      console.error('JOIN APPROVED MESSAGE ERROR:', err);
+    }
+  } catch (err) {
+    console.error('CHAT JOIN REQUEST HANDLER ERROR:', err);
+  }
+});
+
 cron.schedule('*/10 * * * *', async () => {
   try {
     if (!db) return;
 
     const now = new Date();
+
     const expiredUsers = await db.collection('users').find({
       status: 'ACTIVE',
       end_date: { $lt: now }
@@ -530,6 +735,8 @@ cron.schedule('*/10 * * * *', async () => {
         }
       );
 
+      await revokeActiveJoinLinksForUser(user.user_id);
+
       try {
         await bot.telegram.sendMessage(
           user.user_id,
@@ -545,6 +752,33 @@ cron.schedule('*/10 * * * *', async () => {
         console.error(`EXPIRE MESSAGE ERROR for ${user.user_id}:`, msgErr);
       }
     }
+
+    // تنظيف روابط الانضمام المنتهية الصلاحية
+    const expiredLinks = await db.collection('join_links').find({
+      status: { $in: ['ACTIVE', 'PENDING_JOIN'] },
+      expires_at: { $lt: now }
+    }).toArray();
+
+    for (const link of expiredLinks) {
+      try {
+        await bot.telegram.callApi('revokeChatInviteLink', {
+          chat_id: CHANNEL_ID,
+          invite_link: link.invite_link
+        });
+      } catch (err) {
+        console.error('EXPIRED LINK REVOKE ERROR:', err?.description || err);
+      }
+
+      await db.collection('join_links').updateOne(
+        { _id: link._id },
+        {
+          $set: {
+            status: 'EXPIRED',
+            expired_at: now
+          }
+        }
+      );
+    }
   } catch (err) {
     console.error('CRON ERROR:', err);
   }
@@ -554,7 +788,9 @@ cron.schedule('*/10 * * * *', async () => {
   try {
     await connectDB();
     console.log('Launching bot...');
-    await bot.launch();
+    await bot.launch({
+      allowedUpdates: ['message', 'callback_query', 'chat_join_request']
+    });
     console.log('Bot launched successfully');
   } catch (err) {
     console.error('BOT LAUNCH ERROR:', err);
