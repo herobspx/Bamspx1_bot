@@ -1,51 +1,107 @@
 require('dotenv').config();
+
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+
+console.log('BOOT START');
+console.log('BOT_TOKEN exists:', !!process.env.BOT_TOKEN);
+console.log('MONGO_URI exists:', !!process.env.MONGO_URI);
+console.log('CHANNEL_ID:', process.env.CHANNEL_ID);
+console.log('ADMIN_ID:', process.env.ADMIN_ID);
+
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 const { v4: uuidv4 } = require('uuid');
 const cron = require('node-cron');
 
+if (!process.env.BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN');
+  process.exit(1);
+}
+
+if (!process.env.MONGO_URI) {
+  console.error('Missing MONGO_URI');
+  process.exit(1);
+}
+
+if (!process.env.CHANNEL_ID) {
+  console.error('Missing CHANNEL_ID');
+  process.exit(1);
+}
+
+if (!process.env.ADMIN_ID) {
+  console.error('Missing ADMIN_ID');
+  process.exit(1);
+}
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
-
-// ====== DB ======
 const client = new MongoClient(process.env.MONGO_URI);
-let db;
-(async () => {
-  await client.connect();
-  db = client.db('bamspx1');
-  console.log('DB connected');
-})();
 
-// ====== Config ======
-const CHANNEL_ID = process.env.CHANNEL_ID; // مثال: -100xxxxxxxxx
+let db;
+
+const CHANNEL_ID = Number(process.env.CHANNEL_ID);
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 
+if (Number.isNaN(CHANNEL_ID)) {
+  console.error('CHANNEL_ID is not a valid number:', process.env.CHANNEL_ID);
+  process.exit(1);
+}
+
+if (Number.isNaN(ADMIN_ID)) {
+  console.error('ADMIN_ID is not a valid number:', process.env.ADMIN_ID);
+  process.exit(1);
+}
+
 const PLANS = {
-  "شهري": { price: 250, days: 30 },
-  "3 شهور": { price: 550, days: 90 },
-  "6 شهور": { price: 1000, days: 180 },
-  "سنوي": { price: 2500, days: 365 }
+  'شهري': { price: 250, days: 30 },
+  '3 شهور': { price: 550, days: 90 },
+  '6 شهور': { price: 1000, days: 180 },
+  'سنوي': { price: 2500, days: 365 }
 };
 
-// ====== Helpers ======
+const awaitingProof = new Map();
+
 function mainMenu() {
   return Markup.keyboard([
-    ["💳 الاشتراكات"],
-    ["📌 حالتي"],
-    ["🆘 الدعم"]
+    ['💳 الاشتراكات'],
+    ['📌 حالتي'],
+    ['🆘 الدعم']
   ]).resize();
+}
+
+async function connectDB() {
+  try {
+    console.log('Connecting to MongoDB...');
+    await client.connect();
+    db = client.db('bamspx1');
+    console.log('DB connected');
+  } catch (err) {
+    console.error('DB CONNECTION ERROR:', err);
+    process.exit(1);
+  }
 }
 
 async function createOrder(user, planName) {
   const order_id = uuidv4().slice(0, 8);
   const plan = PLANS[planName];
 
+  if (!plan) {
+    throw new Error(`Invalid plan selected: ${planName}`);
+  }
+
   await db.collection('orders').insertOne({
     order_id,
     user_id: user.id,
-    username: user.username || "",
+    username: user.username || '',
+    full_name: [user.first_name, user.last_name].filter(Boolean).join(' '),
     plan: planName,
     price: plan.price,
-    status: "PENDING",
+    status: 'PENDING',
     created_at: new Date()
   });
 
@@ -62,149 +118,332 @@ function paymentText(order_id, planName, price) {
 - بنك: SAxxxxxxxxxxxxxxxx
 
 📌 بعد التحويل:
-اضغط "تم التحويل" وارسل صورة الإيصال.`;
+اضغط "✅ تم التحويل" ثم أرسل صورة الإيصال.`;
 }
 
-// ====== Start ======
 bot.start(async (ctx) => {
-  await db.collection('users').updateOne(
-    { user_id: ctx.from.id },
-    { $setOnInsert: { user_id: ctx.from.id, status: "NONE" } },
-    { upsert: true }
-  );
+  try {
+    await db.collection('users').updateOne(
+      { user_id: ctx.from.id },
+      {
+        $setOnInsert: {
+          user_id: ctx.from.id,
+          username: ctx.from.username || '',
+          full_name: [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' '),
+          status: 'NONE',
+          created_at: new Date()
+        }
+      },
+      { upsert: true }
+    );
 
-  ctx.reply("أهلاً بك في BAMSPX 👋", mainMenu());
+    await ctx.reply('أهلاً بك في BAMSPX 👋', mainMenu());
+  } catch (err) {
+    console.error('START ERROR:', err);
+    await ctx.reply('حدث خطأ أثناء التشغيل، حاول مرة أخرى.');
+  }
 });
 
-// ====== Subscriptions ======
-bot.hears("💳 الاشتراكات", (ctx) => {
-  ctx.reply("اختر الباقة:", Markup.inlineKeyboard([
-    [Markup.button.callback("شهري - 250", "plan_شهري")],
-    [Markup.button.callback("3 شهور - 550", "plan_3 شهور")],
-    [Markup.button.callback("6 شهور - 1000", "plan_6 شهور")],
-    [Markup.button.callback("سنوي - 2500", "plan_سنوي")]
-  ]));
+bot.hears('💳 الاشتراكات', async (ctx) => {
+  try {
+    await ctx.reply(
+      'اختر الباقة:',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('شهري - 250 ريال', 'plan_شهري')],
+        [Markup.button.callback('3 شهور - 550 ريال', 'plan_3 شهور')],
+        [Markup.button.callback('6 شهور - 1000 ريال', 'plan_6 شهور')],
+        [Markup.button.callback('سنوي - 2500 ريال', 'plan_سنوي')]
+      ])
+    );
+  } catch (err) {
+    console.error('SUBSCRIPTIONS MENU ERROR:', err);
+    await ctx.reply('تعذر عرض الباقات حالياً.');
+  }
+});
+
+bot.hears('🆘 الدعم', async (ctx) => {
+  try {
+    await ctx.reply('راسل الإدارة مباشرة إذا واجهت أي مشكلة في الدفع أو التفعيل.');
+  } catch (err) {
+    console.error('SUPPORT ERROR:', err);
+  }
 });
 
 bot.action(/plan_(.+)/, async (ctx) => {
-  const planName = ctx.match[1];
-  const { order_id, plan } = await createOrder(ctx.from, planName);
+  try {
+    const planName = ctx.match[1];
+    const { order_id, plan } = await createOrder(ctx.from, planName);
 
-  await ctx.reply(paymentText(order_id, planName, plan.price), Markup.inlineKeyboard([
-    [Markup.button.callback("✅ تم التحويل", `paid_${order_id}`)]
-  ]));
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      paymentText(order_id, planName, plan.price),
+      Markup.inlineKeyboard([
+        [Markup.button.callback('✅ تم التحويل', `paid_${order_id}`)]
+      ])
+    );
+  } catch (err) {
+    console.error('PLAN ACTION ERROR:', err);
+    try {
+      await ctx.answerCbQuery('حدث خطأ');
+      await ctx.reply('تعذر إنشاء الطلب، حاول مرة أخرى.');
+    } catch (_) {}
+  }
 });
 
-// ====== Upload Proof ======
-const awaitingProof = new Map();
-
 bot.action(/paid_(.+)/, async (ctx) => {
-  const order_id = ctx.match[1];
-  awaitingProof.set(ctx.from.id, order_id);
-  await ctx.reply("📤 أرسل صورة الإيصال الآن:");
+  try {
+    const order_id = ctx.match[1];
+    awaitingProof.set(ctx.from.id, order_id);
+
+    await ctx.answerCbQuery();
+    await ctx.reply('📤 أرسل صورة الإيصال الآن:');
+  } catch (err) {
+    console.error('PAID ACTION ERROR:', err);
+    try {
+      await ctx.answerCbQuery('حدث خطأ');
+    } catch (_) {}
+  }
 });
 
 bot.on('photo', async (ctx) => {
-  const order_id = awaitingProof.get(ctx.from.id);
-  if (!order_id) return;
+  try {
+    const order_id = awaitingProof.get(ctx.from.id);
+    if (!order_id) return;
 
-  const file_id = ctx.message.photo.pop().file_id;
+    const photoSizes = ctx.message.photo;
+    const file_id = photoSizes[photoSizes.length - 1].file_id;
 
-  await db.collection('orders').updateOne(
-    { order_id },
-    { $set: { proof_file_id: file_id, status: "PENDING_REVIEW" } }
-  );
+    const order = await db.collection('orders').findOne({ order_id });
+    if (!order) {
+      awaitingProof.delete(ctx.from.id);
+      return await ctx.reply('تعذر العثور على الطلب، أعد المحاولة.');
+    }
 
-  awaitingProof.delete(ctx.from.id);
+    await db.collection('orders').updateOne(
+      { order_id },
+      {
+        $set: {
+          proof_file_id: file_id,
+          status: 'PENDING_REVIEW',
+          proof_uploaded_at: new Date()
+        }
+      }
+    );
 
-  // Notify admin
-  await bot.telegram.sendPhoto(ADMIN_ID, file_id, {
-    caption: `طلب جديد\nID: ${order_id}`,
-    ...Markup.inlineKeyboard([
-      [
-        Markup.button.callback("✅ قبول", `approve_${order_id}`),
-        Markup.button.callback("❌ رفض", `reject_${order_id}`)
-      ]
-    ])
-  });
+    awaitingProof.delete(ctx.from.id);
 
-  ctx.reply("⏳ تم استلام الإثبات، بانتظار المراجعة.");
+    await bot.telegram.sendPhoto(ADMIN_ID, file_id, {
+      caption: `📥 طلب جديد للمراجعة
+
+🧾 رقم الطلب: ${order_id}
+👤 المستخدم: ${ctx.from.first_name || ''} ${ctx.from.last_name || ''}
+🆔 Telegram ID: ${ctx.from.id}
+📦 الباقة: ${order.plan}
+💰 المبلغ: ${order.price} ريال`,
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('✅ قبول', `approve_${order_id}`),
+          Markup.button.callback('❌ رفض', `reject_${order_id}`)
+        ]
+      ])
+    });
+
+    await ctx.reply('⏳ تم استلام الإثبات، وجارٍ مراجعته من الإدارة.');
+  } catch (err) {
+    console.error('PHOTO HANDLER ERROR:', err);
+    await ctx.reply('حدث خطأ أثناء رفع الإيصال.');
+  }
 });
 
-// ====== Admin Approve/Reject ======
 bot.action(/approve_(.+)/, async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
+  try {
+    if (ctx.from.id !== ADMIN_ID) {
+      return await ctx.answerCbQuery('غير مصرح');
+    }
 
-  const order_id = ctx.match[1];
-  const order = await db.collection('orders').findOne({ order_id });
-  if (!order) return;
+    const order_id = ctx.match[1];
+    const order = await db.collection('orders').findOne({ order_id });
 
-  const now = new Date();
-  const end = new Date(now.getTime() + (PLANS[order.plan].days * 86400000));
+    if (!order) {
+      return await ctx.answerCbQuery('الطلب غير موجود');
+    }
 
-  await db.collection('users').updateOne(
-    { user_id: order.user_id },
-    { $set: { status: "ACTIVE", plan: order.plan, start_date: now, end_date: end } },
-    { upsert: true }
-  );
+    if (order.status === 'APPROVED') {
+      return await ctx.answerCbQuery('تم اعتماد الطلب مسبقاً');
+    }
 
-  await db.collection('orders').updateOne(
-    { order_id },
-    { $set: { status: "APPROVED" } }
-  );
+    const planInfo = PLANS[order.plan];
+    if (!planInfo) {
+      throw new Error(`Plan not found for approved order: ${order.plan}`);
+    }
 
-  // Add to channel
-  await bot.telegram.unbanChatMember(CHANNEL_ID, order.user_id);
+    const now = new Date();
+    const end = new Date(now.getTime() + planInfo.days * 24 * 60 * 60 * 1000);
 
-  await bot.telegram.sendMessage(order.user_id, `✅ تم التفعيل حتى ${end.toLocaleString()}`);
+    await db.collection('users').updateOne(
+      { user_id: order.user_id },
+      {
+        $set: {
+          status: 'ACTIVE',
+          plan: order.plan,
+          start_date: now,
+          end_date: end,
+          updated_at: new Date()
+        }
+      },
+      { upsert: true }
+    );
 
-  ctx.editMessageCaption(`✅ تم قبول الطلب ${order_id}`);
+    await db.collection('orders').updateOne(
+      { order_id },
+      {
+        $set: {
+          status: 'APPROVED',
+          approved_at: new Date(),
+          approved_by: ctx.from.id
+        }
+      }
+    );
+
+    try {
+      await bot.telegram.unbanChatMember(CHANNEL_ID, order.user_id);
+    } catch (channelErr) {
+      console.error('CHANNEL UNBAN ERROR:', channelErr);
+    }
+
+    await bot.telegram.sendMessage(
+      order.user_id,
+      `✅ تم تفعيل اشتراكك بنجاح
+
+📦 الباقة: ${order.plan}
+⏳ ينتهي الاشتراك: ${end.toLocaleString('ar-SA')}`
+    );
+
+    await ctx.answerCbQuery('تم القبول');
+    await ctx.editMessageCaption(`✅ تم قبول الطلب ${order_id}`);
+  } catch (err) {
+    console.error('APPROVE ERROR:', err);
+    try {
+      await ctx.answerCbQuery('حدث خطأ أثناء القبول');
+    } catch (_) {}
+  }
 });
 
 bot.action(/reject_(.+)/, async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
+  try {
+    if (ctx.from.id !== ADMIN_ID) {
+      return await ctx.answerCbQuery('غير مصرح');
+    }
 
-  const order_id = ctx.match[1];
+    const order_id = ctx.match[1];
+    const order = await db.collection('orders').findOne({ order_id });
 
-  await db.collection('orders').updateOne(
-    { order_id },
-    { $set: { status: "REJECTED" } }
-  );
-
-  ctx.editMessageCaption(`❌ تم رفض الطلب ${order_id}`);
-});
-
-// ====== Status ======
-bot.hears("📌 حالتي", async (ctx) => {
-  const user = await db.collection('users').findOne({ user_id: ctx.from.id });
-  if (!user || user.status !== "ACTIVE") {
-    return ctx.reply("❌ لا يوجد اشتراك نشط");
-  }
-
-  ctx.reply(`✅ اشتراكك نشط
-📦 الباقة: ${user.plan}
-⏳ ينتهي: ${new Date(user.end_date).toLocaleString()}`);
-});
-
-// ====== Expiry Cron ======
-cron.schedule("*/10 * * * *", async () => {
-  const now = new Date();
-  const users = await db.collection('users').find({
-    status: "ACTIVE",
-    end_date: { $lt: now }
-  }).toArray();
-
-  for (const u of users) {
-    await bot.telegram.banChatMember(CHANNEL_ID, u.user_id);
-    await bot.telegram.unbanChatMember(CHANNEL_ID, u.user_id);
-
-    await db.collection('users').updateOne(
-      { user_id: u.user_id },
-      { $set: { status: "EXPIRED" } }
+    await db.collection('orders').updateOne(
+      { order_id },
+      {
+        $set: {
+          status: 'REJECTED',
+          rejected_at: new Date(),
+          rejected_by: ctx.from.id
+        }
+      }
     );
 
-    await bot.telegram.sendMessage(u.user_id, "⛔ انتهى اشتراكك، جدد للدخول مجددًا.");
+    if (order?.user_id) {
+      await bot.telegram.sendMessage(
+        order.user_id,
+        `❌ تم رفض طلبك رقم ${order_id}
+يرجى التواصل مع الدعم أو إعادة رفع إثبات صحيح.`
+      );
+    }
+
+    await ctx.answerCbQuery('تم الرفض');
+    await ctx.editMessageCaption(`❌ تم رفض الطلب ${order_id}`);
+  } catch (err) {
+    console.error('REJECT ERROR:', err);
+    try {
+      await ctx.answerCbQuery('حدث خطأ أثناء الرفض');
+    } catch (_) {}
   }
 });
 
-bot.launch();
+bot.hears('📌 حالتي', async (ctx) => {
+  try {
+    const user = await db.collection('users').findOne({ user_id: ctx.from.id });
+
+    if (!user || user.status !== 'ACTIVE') {
+      return await ctx.reply('❌ لا يوجد لديك اشتراك نشط حالياً.');
+    }
+
+    await ctx.reply(`✅ اشتراكك نشط
+📦 الباقة: ${user.plan}
+⏳ ينتهي: ${new Date(user.end_date).toLocaleString('ar-SA')}`);
+  } catch (err) {
+    console.error('STATUS ERROR:', err);
+    await ctx.reply('تعذر جلب حالة الاشتراك حالياً.');
+  }
+});
+
+cron.schedule('*/10 * * * *', async () => {
+  try {
+    if (!db) return;
+
+    const now = new Date();
+    const expiredUsers = await db.collection('users').find({
+      status: 'ACTIVE',
+      end_date: { $lt: now }
+    }).toArray();
+
+    for (const user of expiredUsers) {
+      try {
+        await bot.telegram.banChatMember(CHANNEL_ID, user.user_id);
+        await bot.telegram.unbanChatMember(CHANNEL_ID, user.user_id);
+      } catch (channelErr) {
+        console.error(`EXPIRE CHANNEL ERROR for ${user.user_id}:`, channelErr);
+      }
+
+      await db.collection('users').updateOne(
+        { user_id: user.user_id },
+        {
+          $set: {
+            status: 'EXPIRED',
+            expired_at: new Date()
+          }
+        }
+      );
+
+      try {
+        await bot.telegram.sendMessage(
+          user.user_id,
+          '⛔ انتهى اشتراكك، يرجى التجديد للدخول مرة أخرى.'
+        );
+      } catch (msgErr) {
+        console.error(`EXPIRE MESSAGE ERROR for ${user.user_id}:`, msgErr);
+      }
+    }
+  } catch (err) {
+    console.error('CRON ERROR:', err);
+  }
+});
+
+(async () => {
+  try {
+    await connectDB();
+    console.log('Launching bot...');
+    await bot.launch();
+    console.log('Bot launched successfully');
+  } catch (err) {
+    console.error('BOT LAUNCH ERROR:', err);
+    process.exit(1);
+  }
+})();
+
+process.once('SIGINT', () => {
+  console.log('SIGINT received, stopping bot...');
+  bot.stop('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+  console.log('SIGTERM received, stopping bot...');
+  bot.stop('SIGTERM');
+});
