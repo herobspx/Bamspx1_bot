@@ -56,10 +56,9 @@ let db;
 const CHANNEL_ID = Number(process.env.CHANNEL_ID);
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 
-const STC_PAY = process.env.STC_PAY || '05XXXXXXXX';
-const BANK_IBAN = process.env.BANK_IBAN || 'SAxxxxxxxxxxxxxxxxxxxx';
 const BANK_NAME = process.env.BANK_NAME || 'اسم البنك';
 const ACCOUNT_NAME = process.env.ACCOUNT_NAME || 'اسم صاحب الحساب';
+const BANK_IBAN = process.env.BANK_IBAN || 'SAxxxxxxxxxxxxxxxxxxxx';
 const SUPPORT_USERNAME = process.env.SUPPORT_USERNAME || '@support';
 const CHANNEL_INVITE_LINK = process.env.CHANNEL_INVITE_LINK || 'https://t.me/';
 
@@ -83,10 +82,19 @@ const awaitingProof = new Map();
 
 function mainMenu() {
   return Markup.keyboard([
-    ['💳 الاشتراكات'],
-    ['📌 حالتي'],
-    ['🆘 الدعم']
+    ['الاشتراكات', 'حالة الاشتراك'],
+    ['الدعم']
   ]).resize();
+}
+
+function plansMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('شهري — 250 ريال', 'plan_شهري')],
+    [Markup.button.callback('3 شهور — 550 ريال', 'plan_3 شهور')],
+    [Markup.button.callback('6 شهور — 1000 ريال', 'plan_6 شهور')],
+    [Markup.button.callback('سنوي — 2500 ريال', 'plan_سنوي')],
+    [Markup.button.callback('رجوع', 'back_main')]
+  ]);
 }
 
 async function connectDB() {
@@ -124,18 +132,21 @@ async function createOrder(user, planName) {
 }
 
 function paymentText(order_id, planName, price) {
-  return `🧾 رقم الطلب: ${order_id}
-📦 الباقة: ${planName}
-💰 المبلغ: ${price} ريال
+  return `تفاصيل الطلب
 
-💳 طرق الدفع:
-- STC Pay: ${STC_PAY}
-- البنك: ${BANK_NAME}
-- اسم الحساب: ${ACCOUNT_NAME}
-- الآيبان: ${BANK_IBAN}
+رقم الطلب: ${order_id}
+الباقة: ${planName}
+المبلغ: ${price} ريال
 
-📌 بعد التحويل:
-اضغط "✅ تم التحويل" ثم أرسل صورة الإيصال.`;
+طريقة الدفع:
+تحويل بنكي
+
+اسم البنك: ${BANK_NAME}
+اسم الحساب: ${ACCOUNT_NAME}
+رقم الآيبان:
+${BANK_IBAN}
+
+بعد التحويل اضغط "تم التحويل" ثم أرسل صورة الإيصال.`;
 }
 
 bot.start(async (ctx) => {
@@ -154,23 +165,28 @@ bot.start(async (ctx) => {
       { upsert: true }
     );
 
-    await ctx.reply('👋 أهلاً بك في BAMSPX', mainMenu());
+    await ctx.reply(
+      `أهلاً بك في BAMSPX
+
+من هنا يمكنك:
+- الاشتراك
+- متابعة حالة اشتراكك
+- التواصل مع الدعم`,
+      mainMenu()
+    );
   } catch (err) {
     console.error('START ERROR:', err);
     await ctx.reply('حدث خطأ أثناء التشغيل، حاول مرة أخرى.');
   }
 });
 
-bot.hears('💳 الاشتراكات', async (ctx) => {
+bot.hears('الاشتراكات', async (ctx) => {
   try {
     await ctx.reply(
-      'اختر الباقة:',
-      Markup.inlineKeyboard([
-        [Markup.button.callback('شهري - 250 ريال', 'plan_شهري')],
-        [Markup.button.callback('3 شهور - 550 ريال', 'plan_3 شهور')],
-        [Markup.button.callback('6 شهور - 1000 ريال', 'plan_6 شهور')],
-        [Markup.button.callback('سنوي - 2500 ريال', 'plan_سنوي')]
-      ])
+      `الباقات المتاحة
+
+اختر الباقة المناسبة:`,
+      plansMenu()
     );
   } catch (err) {
     console.error('SUBSCRIPTIONS MENU ERROR:', err);
@@ -178,17 +194,95 @@ bot.hears('💳 الاشتراكات', async (ctx) => {
   }
 });
 
-bot.hears('🆘 الدعم', async (ctx) => {
+bot.hears('حالة الاشتراك', async (ctx) => {
+  try {
+    const user = await db.collection('users').findOne({ user_id: ctx.from.id });
+
+    if (!user || user.status !== 'ACTIVE') {
+      return await ctx.reply(
+        `لا يوجد لديك اشتراك نشط حالياً.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback('الاشتراكات', 'open_plans')],
+          [Markup.button.callback('الدعم', 'open_support')]
+        ])
+      );
+    }
+
+    await ctx.reply(
+      `حالة الاشتراك: نشط
+
+الباقة: ${user.plan}
+ينتهي: ${new Date(user.end_date).toLocaleString('ar-SA')}`,
+      Markup.inlineKeyboard([
+        [Markup.button.url('دخول القناة', CHANNEL_INVITE_LINK)],
+        [Markup.button.callback('تجديد الاشتراك', 'open_plans')]
+      ])
+    );
+  } catch (err) {
+    console.error('STATUS ERROR:', err);
+    await ctx.reply('تعذر جلب حالة الاشتراك حالياً.');
+  }
+});
+
+bot.hears('الدعم', async (ctx) => {
   try {
     await ctx.reply(
-      `للتواصل مع الإدارة والدعم الفني:
+      `للتواصل مع الدعم:
 ${SUPPORT_USERNAME}`,
       Markup.inlineKeyboard([
-        [Markup.button.url('📩 تواصل مع الإدارة', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
+        [Markup.button.url('تواصل مع الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)],
+        [Markup.button.callback('رجوع', 'back_main')]
       ])
     );
   } catch (err) {
     console.error('SUPPORT ERROR:', err);
+  }
+});
+
+bot.action('back_main', async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      `أهلاً بك في BAMSPX
+
+من هنا يمكنك:
+- الاشتراك
+- متابعة حالة اشتراكك
+- التواصل مع الدعم`,
+      mainMenu()
+    );
+  } catch (err) {
+    console.error('BACK MAIN ERROR:', err);
+  }
+});
+
+bot.action('open_plans', async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      `الباقات المتاحة
+
+اختر الباقة المناسبة:`,
+      plansMenu()
+    );
+  } catch (err) {
+    console.error('OPEN PLANS ERROR:', err);
+  }
+});
+
+bot.action('open_support', async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      `للتواصل مع الدعم:
+${SUPPORT_USERNAME}`,
+      Markup.inlineKeyboard([
+        [Markup.button.url('تواصل مع الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)],
+        [Markup.button.callback('رجوع', 'back_main')]
+      ])
+    );
+  } catch (err) {
+    console.error('OPEN SUPPORT ERROR:', err);
   }
 });
 
@@ -201,7 +295,9 @@ bot.action(/plan_(.+)/, async (ctx) => {
     await ctx.reply(
       paymentText(order_id, planName, plan.price),
       Markup.inlineKeyboard([
-        [Markup.button.callback('✅ تم التحويل', `paid_${order_id}`)]
+        [Markup.button.callback('تم التحويل', `paid_${order_id}`)],
+        [Markup.button.callback('نسخ الآيبان', 'copy_iban')],
+        [Markup.button.callback('رجوع', 'open_plans')]
       ])
     );
   } catch (err) {
@@ -213,13 +309,25 @@ bot.action(/plan_(.+)/, async (ctx) => {
   }
 });
 
+bot.action('copy_iban', async (ctx) => {
+  try {
+    await ctx.answerCbQuery('تم عرض الآيبان');
+    await ctx.reply(
+      `رقم الآيبان:
+${BANK_IBAN}`
+    );
+  } catch (err) {
+    console.error('COPY IBAN ERROR:', err);
+  }
+});
+
 bot.action(/paid_(.+)/, async (ctx) => {
   try {
     const order_id = ctx.match[1];
     awaitingProof.set(ctx.from.id, order_id);
 
     await ctx.answerCbQuery();
-    await ctx.reply('📤 أرسل صورة الإيصال الآن:');
+    await ctx.reply('أرسل صورة الإيصال الآن.');
   } catch (err) {
     console.error('PAID ACTION ERROR:', err);
     try {
@@ -256,22 +364,28 @@ bot.on('photo', async (ctx) => {
     awaitingProof.delete(ctx.from.id);
 
     await bot.telegram.sendPhoto(ADMIN_ID, file_id, {
-      caption: `📥 طلب جديد للمراجعة
+      caption: `طلب اشتراك جديد
 
-🧾 رقم الطلب: ${order_id}
-👤 المستخدم: ${ctx.from.first_name || ''} ${ctx.from.last_name || ''}
-🆔 Telegram ID: ${ctx.from.id}
-📦 الباقة: ${order.plan}
-💰 المبلغ: ${order.price} ريال`,
+رقم الطلب: ${order_id}
+اسم المستخدم: ${ctx.from.first_name || ''} ${ctx.from.last_name || ''}
+Telegram ID: ${ctx.from.id}
+الباقة: ${order.plan}
+المبلغ: ${order.price} ريال
+
+يرجى مراجعة الإيصال واتخاذ الإجراء المناسب.`,
       ...Markup.inlineKeyboard([
         [
-          Markup.button.callback('✅ قبول', `approve_${order_id}`),
-          Markup.button.callback('❌ رفض', `reject_${order_id}`)
+          Markup.button.callback('قبول الطلب', `approve_${order_id}`),
+          Markup.button.callback('رفض الطلب', `reject_${order_id}`)
         ]
       ])
     });
 
-    await ctx.reply('⏳ تم استلام الإثبات، وجارٍ مراجعته من الإدارة.');
+    await ctx.reply(
+      `تم استلام الإيصال.
+
+طلبك الآن تحت المراجعة، وسيتم إشعارك بعد اعتماد الاشتراك.`
+    );
   } catch (err) {
     console.error('PHOTO HANDLER ERROR:', err);
     await ctx.reply('حدث خطأ أثناء رفع الإيصال.');
@@ -330,21 +444,20 @@ bot.action(/approve_(.+)/, async (ctx) => {
 
     await bot.telegram.sendMessage(
       order.user_id,
-      `✅ تم تفعيل اشتراكك بنجاح
+      `تم تفعيل اشتراكك بنجاح
 
-📦 الباقة: ${order.plan}
-⏳ ينتهي الاشتراك: ${end.toLocaleString('ar-SA')}
+الباقة: ${order.plan}
+ينتهي الاشتراك: ${end.toLocaleString('ar-SA')}
 
-🔗 رابط دخول القناة الخاصة:
-${CHANNEL_INVITE_LINK}`,
+يمكنك الدخول إلى القناة من الرابط التالي.`,
       Markup.inlineKeyboard([
-        [Markup.button.url('🚀 دخول القناة', CHANNEL_INVITE_LINK)],
-        [Markup.button.url('📩 الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
+        [Markup.button.url('دخول القناة', CHANNEL_INVITE_LINK)],
+        [Markup.button.url('الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
       ])
     );
 
     await ctx.answerCbQuery('تم القبول');
-    await ctx.editMessageCaption(`✅ تم قبول الطلب ${order_id}`);
+    await ctx.editMessageCaption(`تم قبول الطلب ${order_id}`);
   } catch (err) {
     console.error('APPROVE ERROR:', err);
     try {
@@ -376,41 +489,23 @@ bot.action(/reject_(.+)/, async (ctx) => {
     if (order?.user_id) {
       await bot.telegram.sendMessage(
         order.user_id,
-        `❌ تم رفض طلبك رقم ${order_id}
-يرجى التواصل مع الدعم:
-${SUPPORT_USERNAME}`
+        `تعذر اعتماد طلبك.
+
+يرجى التواصل مع الدعم أو إعادة إرسال إثبات واضح.`,
+        Markup.inlineKeyboard([
+          [Markup.button.url('التواصل مع الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)],
+          [Markup.button.callback('إعادة الاشتراك', 'open_plans')]
+        ])
       );
     }
 
     await ctx.answerCbQuery('تم الرفض');
-    await ctx.editMessageCaption(`❌ تم رفض الطلب ${order_id}`);
+    await ctx.editMessageCaption(`تم رفض الطلب ${order_id}`);
   } catch (err) {
     console.error('REJECT ERROR:', err);
     try {
       await ctx.answerCbQuery('حدث خطأ أثناء الرفض');
     } catch (_) {}
-  }
-});
-
-bot.hears('📌 حالتي', async (ctx) => {
-  try {
-    const user = await db.collection('users').findOne({ user_id: ctx.from.id });
-
-    if (!user || user.status !== 'ACTIVE') {
-      return await ctx.reply('❌ لا يوجد لديك اشتراك نشط حالياً.');
-    }
-
-    await ctx.reply(
-      `✅ اشتراكك نشط
-📦 الباقة: ${user.plan}
-⏳ ينتهي: ${new Date(user.end_date).toLocaleString('ar-SA')}`,
-      Markup.inlineKeyboard([
-        [Markup.button.url('🔗 دخول القناة', CHANNEL_INVITE_LINK)]
-      ])
-    );
-  } catch (err) {
-    console.error('STATUS ERROR:', err);
-    await ctx.reply('تعذر جلب حالة الاشتراك حالياً.');
   }
 });
 
@@ -438,9 +533,13 @@ cron.schedule('*/10 * * * *', async () => {
       try {
         await bot.telegram.sendMessage(
           user.user_id,
-          `⛔ انتهى اشتراكك.
-للتجديد تواصل عبر البوت أو مع الدعم:
-${SUPPORT_USERNAME}`
+          `انتهى اشتراكك.
+
+يمكنك التجديد من خلال البوت أو التواصل مع الدعم.`,
+          Markup.inlineKeyboard([
+            [Markup.button.callback('تجديد الاشتراك', 'open_plans')],
+            [Markup.button.url('الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
+          ])
         );
       } catch (msgErr) {
         console.error(`EXPIRE MESSAGE ERROR for ${user.user_id}:`, msgErr);
