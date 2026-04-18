@@ -62,6 +62,7 @@ const SUPPORT_USERNAME = process.env.SUPPORT_USERNAME || '@support';
 
 const JOIN_LINK_EXPIRE_MINUTES = Number(process.env.JOIN_LINK_EXPIRE_MINUTES || 10);
 const REMINDER_DAYS_BEFORE = Number(process.env.REMINDER_DAYS_BEFORE || 3);
+const TRIAL_HOURS = Number(process.env.TRIAL_HOURS || 48);
 
 if (Number.isNaN(CHANNEL_ID)) {
   console.error('CHANNEL_ID is not a valid number:', process.env.CHANNEL_ID);
@@ -79,6 +80,10 @@ if (Number.isNaN(REMINDER_DAYS_BEFORE) || REMINDER_DAYS_BEFORE < 0) {
   console.error('REMINDER_DAYS_BEFORE is invalid');
   process.exit(1);
 }
+if (Number.isNaN(TRIAL_HOURS) || TRIAL_HOURS <= 0) {
+  console.error('TRIAL_HOURS is invalid');
+  process.exit(1);
+}
 
 const PLANS = {
   'شهري': { price: 250, days: 30 },
@@ -88,6 +93,7 @@ const PLANS = {
 };
 
 const awaitingProof = new Map();
+const awaitingTrialPhone = new Map();
 
 function isAdmin(userId) {
   return Number(userId) === ADMIN_ID;
@@ -96,7 +102,7 @@ function isAdmin(userId) {
 function mainMenu(userId) {
   const rows = [
     ['الاشتراك', 'اشتراكي'],
-    ['الدعم']
+    ['فترة تجريبية', 'الدعم']
   ];
 
   if (isAdmin(userId)) {
@@ -161,19 +167,18 @@ function activeSubscriptionButtons(joinLink) {
   return Markup.inlineKeyboard(rows);
 }
 
+function trialPhoneKeyboard() {
+  return Markup.keyboard([
+    [{ text: 'مشاركة رقم الجوال', request_contact: true }],
+    ['رجوع']
+  ]).resize();
+}
+
 async function connectDB() {
   try {
     console.log('Connecting to MongoDB...');
     await client.connect();
     db = client.db('bamspx1');
-
-    await db.collection('users').createIndex({ user_id: 1 }, { unique: true });
-    await db.collection('orders').createIndex({ order_id: 1 }, { unique: true });
-    await db.collection('join_links').createIndex({ invite_link: 1 }, { unique: true });
-    await db.collection('join_links').createIndex({ user_id: 1 });
-    await db.collection('users').createIndex({ status: 1 });
-    await db.collection('orders').createIndex({ status: 1 });
-
     console.log('DB connected');
   } catch (err) {
     console.error('DB CONNECTION ERROR:', err);
@@ -237,6 +242,11 @@ async function ensureUser(ctx) {
   );
 }
 
+function normalizePhone(phone) {
+  if (!phone) return '';
+  return phone.replace(/[^\d+]/g, '');
+}
+
 async function revokeLink(inviteLink) {
   try {
     await bot.telegram.callApi('revokeChatInviteLink', {
@@ -268,28 +278,28 @@ async function revokeActiveJoinLinksForUser(userId) {
   }
 }
 
-async function createPrivateJoinRequestLinkForUser(userId, orderId) {
+async function createPrivateJoinRequestLinkForUser(userId, sourceId, sourceType = 'paid') {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + JOIN_LINK_EXPIRE_MINUTES * 60 * 1000);
   const expireDateUnix = Math.floor(expiresAt.getTime() / 1000);
 
   const linkResponse = await bot.telegram.callApi('createChatInviteLink', {
     chat_id: CHANNEL_ID,
-    name: `user_${userId}_order_${orderId}`,
+    name: `${sourceType}_${userId}_${sourceId}`,
     expire_date: expireDateUnix,
     creates_join_request: true
   });
 
   await db.collection('join_links').insertOne({
     user_id: userId,
-    order_id: orderId,
+    source_id: sourceId,
+    source_type: sourceType,
     invite_link: linkResponse.invite_link,
     expires_at: expiresAt,
     status: 'ACTIVE',
     created_at: new Date(),
     used_by_user_id: null,
-    approved_join_at: null,
-    reminder_sent: false
+    approved_join_at: null
   });
 
   return {
@@ -313,8 +323,8 @@ async function getLatestActiveJoinLink(userId) {
 async function createFreshJoinLinkForActiveUser(userId) {
   const user = await db.collection('users').findOne({ user_id: userId });
 
-  if (!user || user.status !== 'ACTIVE') {
-    throw new Error('User does not have active subscription');
+  if (!user || (user.status !== 'ACTIVE' && user.status !== 'TRIAL_ACTIVE')) {
+    throw new Error('User does not have active access');
   }
 
   await revokeActiveJoinLinksForUser(userId);
@@ -327,9 +337,17 @@ async function createFreshJoinLinkForActiveUser(userId) {
     { sort: { approved_at: -1 } }
   );
 
-  const orderId = latestApprovedOrder?.order_id || `manual_${Date.now()}`;
+  if (user.status === 'TRIAL_ACTIVE') {
+    const trial = await db.collection('trials').findOne(
+      { user_id: userId, status: 'ACTIVE' },
+      { sort: { created_at: -1 } }
+    );
+    const sourceId = trial?.trial_id || `trial_${Date.now()}`;
+    return createPrivateJoinRequestLinkForUser(userId, sourceId, 'trial');
+  }
 
-  return createPrivateJoinRequestLinkForUser(userId, orderId);
+  const sourceId = latestApprovedOrder?.order_id || `manual_${Date.now()}`;
+  return createPrivateJoinRequestLinkForUser(userId, sourceId, 'paid');
 }
 
 async function removeUserFromChannel(userId) {
@@ -376,11 +394,39 @@ bot.hears('الاشتراك', async (ctx) => {
   }
 });
 
+bot.hears('فترة تجريبية', async (ctx) => {
+  try {
+    const existingActive = await db.collection('users').findOne({
+      user_id: ctx.from.id,
+      status: { $in: ['ACTIVE', 'TRIAL_ACTIVE'] }
+    });
+
+    if (existingActive) {
+      return await ctx.reply(
+        'لديك وصول نشط حالياً، ولا يمكن تفعيل تجربة جديدة.',
+        mainMenu(ctx.from.id)
+      );
+    }
+
+    awaitingTrialPhone.set(ctx.from.id, true);
+
+    await ctx.reply(
+      `للاستفادة من الفترة التجريبية، يرجى مشاركة رقم الجوال.
+
+التجربة متاحة مرة واحدة فقط لمدة ${TRIAL_HOURS} ساعة.`,
+      trialPhoneKeyboard()
+    );
+  } catch (err) {
+    console.error('TRIAL START ERROR:', err);
+    await ctx.reply('تعذر بدء الفترة التجريبية حالياً.');
+  }
+});
+
 bot.hears('اشتراكي', async (ctx) => {
   try {
     const user = await db.collection('users').findOne({ user_id: ctx.from.id });
 
-    if (!user || user.status !== 'ACTIVE') {
+    if (!user || (user.status !== 'ACTIVE' && user.status !== 'TRIAL_ACTIVE')) {
       return await ctx.reply(
         `لا يوجد لديك اشتراك نشط حالياً.`,
         Markup.inlineKeyboard([
@@ -391,11 +437,12 @@ bot.hears('اشتراكي', async (ctx) => {
     }
 
     const joinLink = await getLatestActiveJoinLink(ctx.from.id);
+    const statusText = user.status === 'TRIAL_ACTIVE' ? 'تجربة نشطة' : 'نشط';
 
     await ctx.reply(
-      `حالة الاشتراك: نشط
+      `حالة الاشتراك: ${statusText}
 
-الباقة: ${user.plan}
+الباقة: ${user.plan || 'فترة تجريبية'}
 ينتهي: ${new Date(user.end_date).toLocaleString('ar-SA')}`,
       activeSubscriptionButtons(joinLink)
     );
@@ -423,6 +470,120 @@ bot.hears('الإدارة', async (ctx) => {
     await ctx.reply('لوحة الإدارة', adminMenu());
   } catch (err) {
     console.error('ADMIN MENU ERROR:', err);
+  }
+});
+
+bot.hears('رجوع', async (ctx) => {
+  try {
+    awaitingTrialPhone.delete(ctx.from.id);
+    await sendMainMenu(ctx, ctx.from.id);
+  } catch (err) {
+    console.error('BACK TEXT ERROR:', err);
+  }
+});
+
+bot.on('contact', async (ctx) => {
+  try {
+    if (!awaitingTrialPhone.get(ctx.from.id)) return;
+
+    const contact = ctx.message.contact;
+    if (!contact) return;
+
+    if (contact.user_id && contact.user_id !== ctx.from.id) {
+      return await ctx.reply('يرجى مشاركة رقم جوالك أنت فقط.');
+    }
+
+    const phoneNumber = normalizePhone(contact.phone_number);
+
+    const existingTrialByPhone = await db.collection('trials').findOne({
+      phone_number: phoneNumber
+    });
+
+    if (existingTrialByPhone) {
+      awaitingTrialPhone.delete(ctx.from.id);
+      return await ctx.reply(
+        'هذا الرقم استفاد من الفترة التجريبية مسبقاً، ولا يمكن تكرار التجربة.',
+        mainMenu(ctx.from.id)
+      );
+    }
+
+    const existingTrialByUser = await db.collection('trials').findOne({
+      user_id: ctx.from.id
+    });
+
+    if (existingTrialByUser) {
+      awaitingTrialPhone.delete(ctx.from.id);
+      return await ctx.reply(
+        'تم استخدام الفترة التجريبية لهذا الحساب مسبقاً.',
+        mainMenu(ctx.from.id)
+      );
+    }
+
+    const now = new Date();
+    const endDate = new Date(now.getTime() + TRIAL_HOURS * 60 * 60 * 1000);
+    const trialId = uuidv4().slice(0, 8);
+
+    await db.collection('trials').insertOne({
+      trial_id: trialId,
+      user_id: ctx.from.id,
+      username: ctx.from.username || '',
+      full_name: [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' '),
+      phone_number: phoneNumber,
+      status: 'ACTIVE',
+      created_at: now,
+      start_date: now,
+      end_date: endDate
+    });
+
+    await db.collection('users').updateOne(
+      { user_id: ctx.from.id },
+      {
+        $set: {
+          status: 'TRIAL_ACTIVE',
+          plan: 'فترة تجريبية',
+          phone_number: phoneNumber,
+          start_date: now,
+          end_date: endDate,
+          updated_at: new Date()
+        }
+      },
+      { upsert: true }
+    );
+
+    await revokeActiveJoinLinksForUser(ctx.from.id);
+    const { inviteLink } = await createPrivateJoinRequestLinkForUser(ctx.from.id, trialId, 'trial');
+
+    awaitingTrialPhone.delete(ctx.from.id);
+
+    await ctx.reply(
+      `تم تفعيل الفترة التجريبية بنجاح.
+
+مدة التجربة: ${TRIAL_HOURS} ساعة
+تنتهي: ${endDate.toLocaleString('ar-SA')}
+
+هذا الرابط خاص بك فقط.`,
+      Markup.inlineKeyboard([
+        [Markup.button.url('طلب الانضمام', inviteLink)],
+        [Markup.button.callback('رابط جديد', 'new_link')]
+      ])
+    );
+
+    try {
+      await bot.telegram.sendMessage(
+        ADMIN_ID,
+        `تفعيل فترة تجريبية جديدة
+
+المستخدم: ${ctx.from.first_name || ''} ${ctx.from.last_name || ''}
+Telegram ID: ${ctx.from.id}
+رقم الجوال: ${phoneNumber}
+تنتهي: ${endDate.toLocaleString('ar-SA')}`
+      );
+    } catch (err) {
+      console.error('ADMIN TRIAL NOTICE ERROR:', err);
+    }
+  } catch (err) {
+    console.error('CONTACT HANDLER ERROR:', err);
+    await ctx.reply('حدث خطأ أثناء تفعيل الفترة التجريبية.');
   }
 });
 
@@ -582,7 +743,12 @@ bot.action(/approve_(.+)/, async (ctx) => {
     const now = new Date();
 
     let startDate = now;
-    if (currentUser && currentUser.status === 'ACTIVE' && currentUser.end_date && new Date(currentUser.end_date) > now) {
+    if (
+      currentUser &&
+      (currentUser.status === 'ACTIVE' || currentUser.status === 'TRIAL_ACTIVE') &&
+      currentUser.end_date &&
+      new Date(currentUser.end_date) > now
+    ) {
       startDate = new Date(currentUser.end_date);
     }
 
@@ -594,7 +760,7 @@ bot.action(/approve_(.+)/, async (ctx) => {
         $set: {
           status: 'ACTIVE',
           plan: order.plan,
-          start_date: currentUser?.status === 'ACTIVE' ? currentUser.start_date || now : now,
+          start_date: currentUser?.start_date || now,
           end_date: endDate,
           updated_at: new Date(),
           reminder_sent: false
@@ -615,7 +781,7 @@ bot.action(/approve_(.+)/, async (ctx) => {
     );
 
     await revokeActiveJoinLinksForUser(order.user_id);
-    const { inviteLink } = await createPrivateJoinRequestLinkForUser(order.user_id, orderId);
+    const { inviteLink } = await createPrivateJoinRequestLinkForUser(order.user_id, orderId, 'paid');
 
     await bot.telegram.sendMessage(
       order.user_id,
@@ -689,8 +855,8 @@ bot.action('new_link', async (ctx) => {
   try {
     const user = await db.collection('users').findOne({ user_id: ctx.from.id });
 
-    if (!user || user.status !== 'ACTIVE') {
-      await ctx.answerCbQuery('لا يوجد اشتراك نشط');
+    if (!user || (user.status !== 'ACTIVE' && user.status !== 'TRIAL_ACTIVE')) {
+      await ctx.answerCbQuery('لا يوجد وصول نشط');
       return;
     }
 
@@ -787,7 +953,7 @@ bot.on('chat_join_request', async (ctx) => {
     });
 
     await db.collection('join_links').updateOne(
-      { _id: joinLink._id },
+      { invite_link: inviteLinkUsed },
       {
         $set: {
           status: 'APPROVED',
@@ -811,7 +977,10 @@ bot.action('admin_stats', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
 
     const activeCount = await db.collection('users').countDocuments({ status: 'ACTIVE' });
-    const expiredCount = await db.collection('users').countDocuments({ status: 'EXPIRED' });
+    const trialCount = await db.collection('users').countDocuments({ status: 'TRIAL_ACTIVE' });
+    const expiredCount = await db.collection('users').countDocuments({
+      status: { $in: ['EXPIRED', 'TRIAL_EXPIRED'] }
+    });
     const pendingOrders = await db.collection('orders').countDocuments({ status: 'PENDING_REVIEW' });
     const approvedOrders = await db.collection('orders').countDocuments({ status: 'APPROVED' });
 
@@ -820,7 +989,8 @@ bot.action('admin_stats', async (ctx) => {
       `الإحصائيات
 
 المشتركين النشطين: ${activeCount}
-الاشتراكات المنتهية: ${expiredCount}
+التجارب النشطة: ${trialCount}
+المنتهية: ${expiredCount}
 الطلبات المعلقة: ${pendingOrders}
 الطلبات المعتمدة: ${approvedOrders}`,
       adminMenu()
@@ -863,7 +1033,7 @@ bot.action('admin_active_users', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
 
     const users = await db.collection('users')
-      .find({ status: 'ACTIVE' })
+      .find({ status: { $in: ['ACTIVE', 'TRIAL_ACTIVE'] } })
       .sort({ end_date: 1 })
       .limit(10)
       .toArray();
@@ -871,14 +1041,14 @@ bot.action('admin_active_users', async (ctx) => {
     await ctx.answerCbQuery();
 
     if (!users.length) {
-      return await ctx.reply('لا يوجد مشتركون نشطون.', adminMenu());
+      return await ctx.reply('لا يوجد وصول نشط حالياً.', adminMenu());
     }
 
     const text = users.map((u, i) =>
-      `${i + 1}) ${u.user_id} — ${u.plan} — ${new Date(u.end_date).toLocaleDateString('ar-SA')}`
+      `${i + 1}) ${u.user_id} — ${u.plan || 'تجربة'} — ${new Date(u.end_date).toLocaleDateString('ar-SA')}`
     ).join('\n');
 
-    await ctx.reply(`أحدث المشتركين النشطين
+    await ctx.reply(`الوصول النشط
 
 ${text}`, adminMenu());
   } catch (err) {
@@ -891,7 +1061,7 @@ bot.action('admin_expired_users', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
 
     const users = await db.collection('users')
-      .find({ status: 'EXPIRED' })
+      .find({ status: { $in: ['EXPIRED', 'TRIAL_EXPIRED'] } })
       .sort({ expired_at: -1 })
       .limit(10)
       .toArray();
@@ -899,14 +1069,14 @@ bot.action('admin_expired_users', async (ctx) => {
     await ctx.answerCbQuery();
 
     if (!users.length) {
-      return await ctx.reply('لا توجد اشتراكات منتهية حالياً.', adminMenu());
+      return await ctx.reply('لا توجد حالات منتهية حالياً.', adminMenu());
     }
 
     const text = users.map((u, i) =>
       `${i + 1}) ${u.user_id} — ${u.plan || '-'}`
     ).join('\n');
 
-    await ctx.reply(`أحدث الاشتراكات المنتهية
+    await ctx.reply(`الوصول المنتهي
 
 ${text}`, adminMenu());
   } catch (err) {
@@ -942,9 +1112,10 @@ bot.command('extend', async (ctx) => {
     const user = await db.collection('users').findOne({ user_id: userId });
     const now = new Date();
 
-    const startFrom = user?.status === 'ACTIVE' && user?.end_date && new Date(user.end_date) > now
-      ? new Date(user.end_date)
-      : now;
+    const startFrom =
+      user?.end_date && new Date(user.end_date) > now
+        ? new Date(user.end_date)
+        : now;
 
     const newEndDate = new Date(startFrom.getTime() + days * 24 * 60 * 60 * 1000);
 
@@ -983,8 +1154,8 @@ bot.command('link', async (ctx) => {
     }
 
     const user = await db.collection('users').findOne({ user_id: userId });
-    if (!user || user.status !== 'ACTIVE') {
-      return await ctx.reply('هذا المستخدم لا يملك اشتراكًا نشطًا.');
+    if (!user || (user.status !== 'ACTIVE' && user.status !== 'TRIAL_ACTIVE')) {
+      return await ctx.reply('هذا المستخدم لا يملك وصولًا نشطًا.');
     }
 
     await revokeActiveJoinLinksForUser(userId);
@@ -1013,12 +1184,12 @@ cron.schedule('*/10 * * * *', async () => {
 
     const now = new Date();
 
-    const expiredUsers = await db.collection('users').find({
+    const expiredPaidUsers = await db.collection('users').find({
       status: 'ACTIVE',
       end_date: { $lt: now }
     }).toArray();
 
-    for (const user of expiredUsers) {
+    for (const user of expiredPaidUsers) {
       await db.collection('users').updateOne(
         { user_id: user.user_id },
         {
@@ -1045,6 +1216,51 @@ cron.schedule('*/10 * * * *', async () => {
         );
       } catch (err) {
         console.error('EXPIRED USER MESSAGE ERROR:', err);
+      }
+    }
+
+    const expiredTrials = await db.collection('trials').find({
+      status: 'ACTIVE',
+      end_date: { $lt: now }
+    }).toArray();
+
+    for (const trial of expiredTrials) {
+      await db.collection('trials').updateOne(
+        { _id: trial._id },
+        {
+          $set: {
+            status: 'EXPIRED',
+            expired_at: now
+          }
+        }
+      );
+
+      await db.collection('users').updateOne(
+        { user_id: trial.user_id },
+        {
+          $set: {
+            status: 'TRIAL_EXPIRED',
+            expired_at: now
+          }
+        }
+      );
+
+      await revokeActiveJoinLinksForUser(trial.user_id);
+      await removeUserFromChannel(trial.user_id);
+
+      try {
+        await bot.telegram.sendMessage(
+          trial.user_id,
+          `انتهت الفترة التجريبية.
+
+يمكنك الآن الاشتراك في الباقة المناسبة لك من خلال البوت.`,
+          Markup.inlineKeyboard([
+            [Markup.button.callback('الاشتراك', 'open_plans')],
+            [Markup.button.url('الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
+          ])
+        );
+      } catch (err) {
+        console.error('TRIAL EXPIRED MESSAGE ERROR:', err);
       }
     }
 
