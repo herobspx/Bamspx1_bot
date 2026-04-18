@@ -14,26 +14,35 @@ console.log('MONGO_URI exists:', !!process.env.MONGO_URI);
 console.log('CHANNEL_ID:', process.env.CHANNEL_ID);
 console.log('ADMIN_ID:', process.env.ADMIN_ID);
 
+const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 const { v4: uuidv4 } = require('uuid');
 const cron = require('node-cron');
 
+const web = express();
+const PORT = process.env.PORT || 3000;
+
+web.get('/', (req, res) => {
+  res.send('BAMSPX bot is running');
+});
+
+web.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
 if (!process.env.BOT_TOKEN) {
   console.error('Missing BOT_TOKEN');
   process.exit(1);
 }
-
 if (!process.env.MONGO_URI) {
   console.error('Missing MONGO_URI');
   process.exit(1);
 }
-
 if (!process.env.CHANNEL_ID) {
   console.error('Missing CHANNEL_ID');
   process.exit(1);
 }
-
 if (!process.env.ADMIN_ID) {
   console.error('Missing ADMIN_ID');
   process.exit(1);
@@ -47,11 +56,17 @@ let db;
 const CHANNEL_ID = Number(process.env.CHANNEL_ID);
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 
+const STC_PAY = process.env.STC_PAY || '05XXXXXXXX';
+const BANK_IBAN = process.env.BANK_IBAN || 'SAxxxxxxxxxxxxxxxxxxxx';
+const BANK_NAME = process.env.BANK_NAME || 'اسم البنك';
+const ACCOUNT_NAME = process.env.ACCOUNT_NAME || 'اسم صاحب الحساب';
+const SUPPORT_USERNAME = process.env.SUPPORT_USERNAME || '@support';
+const CHANNEL_INVITE_LINK = process.env.CHANNEL_INVITE_LINK || 'https://t.me/';
+
 if (Number.isNaN(CHANNEL_ID)) {
   console.error('CHANNEL_ID is not a valid number:', process.env.CHANNEL_ID);
   process.exit(1);
 }
-
 if (Number.isNaN(ADMIN_ID)) {
   console.error('ADMIN_ID is not a valid number:', process.env.ADMIN_ID);
   process.exit(1);
@@ -114,8 +129,10 @@ function paymentText(order_id, planName, price) {
 💰 المبلغ: ${price} ريال
 
 💳 طرق الدفع:
-- STC Pay: 05XXXXXXXX
-- بنك: SAxxxxxxxxxxxxxxxx
+- STC Pay: ${STC_PAY}
+- البنك: ${BANK_NAME}
+- اسم الحساب: ${ACCOUNT_NAME}
+- الآيبان: ${BANK_IBAN}
 
 📌 بعد التحويل:
 اضغط "✅ تم التحويل" ثم أرسل صورة الإيصال.`;
@@ -137,7 +154,7 @@ bot.start(async (ctx) => {
       { upsert: true }
     );
 
-    await ctx.reply('أهلاً بك في BAMSPX 👋', mainMenu());
+    await ctx.reply('👋 أهلاً بك في BAMSPX', mainMenu());
   } catch (err) {
     console.error('START ERROR:', err);
     await ctx.reply('حدث خطأ أثناء التشغيل، حاول مرة أخرى.');
@@ -163,7 +180,13 @@ bot.hears('💳 الاشتراكات', async (ctx) => {
 
 bot.hears('🆘 الدعم', async (ctx) => {
   try {
-    await ctx.reply('راسل الإدارة مباشرة إذا واجهت أي مشكلة في الدفع أو التفعيل.');
+    await ctx.reply(
+      `للتواصل مع الإدارة والدعم الفني:
+${SUPPORT_USERNAME}`,
+      Markup.inlineKeyboard([
+        [Markup.button.url('📩 تواصل مع الإدارة', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
+      ])
+    );
   } catch (err) {
     console.error('SUPPORT ERROR:', err);
   }
@@ -305,18 +328,19 @@ bot.action(/approve_(.+)/, async (ctx) => {
       }
     );
 
-    try {
-      await bot.telegram.unbanChatMember(CHANNEL_ID, order.user_id);
-    } catch (channelErr) {
-      console.error('CHANNEL UNBAN ERROR:', channelErr);
-    }
-
     await bot.telegram.sendMessage(
       order.user_id,
       `✅ تم تفعيل اشتراكك بنجاح
 
 📦 الباقة: ${order.plan}
-⏳ ينتهي الاشتراك: ${end.toLocaleString('ar-SA')}`
+⏳ ينتهي الاشتراك: ${end.toLocaleString('ar-SA')}
+
+🔗 رابط دخول القناة الخاصة:
+${CHANNEL_INVITE_LINK}`,
+      Markup.inlineKeyboard([
+        [Markup.button.url('🚀 دخول القناة', CHANNEL_INVITE_LINK)],
+        [Markup.button.url('📩 الدعم', `https://t.me/${SUPPORT_USERNAME.replace('@', '')}`)]
+      ])
     );
 
     await ctx.answerCbQuery('تم القبول');
@@ -353,7 +377,8 @@ bot.action(/reject_(.+)/, async (ctx) => {
       await bot.telegram.sendMessage(
         order.user_id,
         `❌ تم رفض طلبك رقم ${order_id}
-يرجى التواصل مع الدعم أو إعادة رفع إثبات صحيح.`
+يرجى التواصل مع الدعم:
+${SUPPORT_USERNAME}`
       );
     }
 
@@ -375,9 +400,14 @@ bot.hears('📌 حالتي', async (ctx) => {
       return await ctx.reply('❌ لا يوجد لديك اشتراك نشط حالياً.');
     }
 
-    await ctx.reply(`✅ اشتراكك نشط
+    await ctx.reply(
+      `✅ اشتراكك نشط
 📦 الباقة: ${user.plan}
-⏳ ينتهي: ${new Date(user.end_date).toLocaleString('ar-SA')}`);
+⏳ ينتهي: ${new Date(user.end_date).toLocaleString('ar-SA')}`,
+      Markup.inlineKeyboard([
+        [Markup.button.url('🔗 دخول القناة', CHANNEL_INVITE_LINK)]
+      ])
+    );
   } catch (err) {
     console.error('STATUS ERROR:', err);
     await ctx.reply('تعذر جلب حالة الاشتراك حالياً.');
@@ -395,13 +425,6 @@ cron.schedule('*/10 * * * *', async () => {
     }).toArray();
 
     for (const user of expiredUsers) {
-      try {
-        await bot.telegram.banChatMember(CHANNEL_ID, user.user_id);
-        await bot.telegram.unbanChatMember(CHANNEL_ID, user.user_id);
-      } catch (channelErr) {
-        console.error(`EXPIRE CHANNEL ERROR for ${user.user_id}:`, channelErr);
-      }
-
       await db.collection('users').updateOne(
         { user_id: user.user_id },
         {
@@ -415,7 +438,9 @@ cron.schedule('*/10 * * * *', async () => {
       try {
         await bot.telegram.sendMessage(
           user.user_id,
-          '⛔ انتهى اشتراكك، يرجى التجديد للدخول مرة أخرى.'
+          `⛔ انتهى اشتراكك.
+للتجديد تواصل عبر البوت أو مع الدعم:
+${SUPPORT_USERNAME}`
         );
       } catch (msgErr) {
         console.error(`EXPIRE MESSAGE ERROR for ${user.user_id}:`, msgErr);
